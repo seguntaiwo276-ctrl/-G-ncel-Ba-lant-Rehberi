@@ -1,0 +1,159 @@
+import sqlite3
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters
+)
+
+TOKEN = "YOUR_TOKEN_HERE"
+ADMIN_ID = 123456789          # your numeric Telegram user id
+DB = "rehber.db"
+
+logging.basicConfig(level=logging.INFO)
+
+# ---------- database ----------
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS links(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL,
+        url TEXT NOT NULL,
+        description TEXT,
+        clicks INTEGER DEFAULT 0
+    )""")
+    con.commit()
+    con.close()
+
+def db():
+    return sqlite3.connect(DB)
+
+# ---------- user commands ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("📂 Kategoriler", callback_data="cats")],
+        [InlineKeyboardButton("🔎 Arama", callback_data="help_search")],
+    ]
+    await update.message.reply_text(
+        "👋 *Güncel Bağlantı Rehberi*'ne hoş geldiniz!\n\n"
+        "Kategorilere göz atmak için aşağıdaki butona dokunun.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    con = db()
+    rows = con.execute(
+        "SELECT category, COUNT(*) FROM links GROUP BY category ORDER BY category"
+    ).fetchall()
+    con.close()
+    if not rows:
+        await update.message.reply_text("Henüz bağlantı eklenmemiş.")
+        return
+    kb = [[InlineKeyboardButton(f"{c} ({n})", callback_data=f"cat:{c}")] for c, n in rows]
+    await update.message.reply_text("Bir kategori seçin:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    cat = q.data.split(":", 1)[1]
+    con = db()
+    rows = con.execute(
+        "SELECT id, url, description FROM links WHERE category=? ORDER BY id DESC LIMIT 20",
+        (cat,),
+    ).fetchall()
+    con.close()
+    if not rows:
+        await q.message.reply_text("Bu kategoride bağlantı yok.")
+        return
+    text = f"📂 *{cat}*\n\n"
+    for i, (lid, url, desc) in enumerate(rows, 1):
+        text += f"{i}. [{desc or url}]({url})\n"
+    await q.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+
+async def search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Kullanım: /ara <kelime>")
+        return
+    kw = " ".join(ctx.args)
+    con = db()
+    rows = con.execute(
+        "SELECT url, description FROM links WHERE description LIKE ? OR url LIKE ? OR category LIKE ? LIMIT 20",
+        (f"%{kw}%", f"%{kw}%", f"%{kw}%"),
+    ).fetchall()
+    con.close()
+    if not rows:
+        await update.message.reply_text("Sonuç bulunamadı.")
+        return
+    text = f"🔎 *'{kw}' için sonuçlar*\n\n"
+    for url, desc in rows:
+        text += f"• [{desc or url}]({url})\n"
+    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+
+# ---------- admin commands ----------
+def is_admin(update):
+    return update.effective_user.id == ADMIN_ID
+
+async def add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Kullanım: /ekle <kategori> <url> <açıklama>")
+        return
+    cat, url, desc = ctx.args[0], ctx.args[1], " ".join(ctx.args[2:])
+    con = db()
+    con.execute("INSERT INTO links(category, url, description) VALUES(?,?,?)", (cat, url, desc))
+    con.commit()
+    con.close()
+    await update.message.reply_text(f"✅ Eklendi: [{cat}] {url}")
+
+async def delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Kullanım: /sil <id>")
+        return
+    con = db()
+    con.execute("DELETE FROM links WHERE id=?", (int(ctx.args[0]),))
+    con.commit()
+    con.close()
+    await update.message.reply_text("🗑 Silindi.")
+
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    con = db()
+    total = con.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+    cats = con.execute("SELECT COUNT(DISTINCT category) FROM links").fetchone()[0]
+    con.close()
+    await update.message.reply_text(f"📊 Toplam: {total} bağlantı, {cats} kategori.")
+
+# ---------- callback router ----------
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    if data == "cats":
+        await categories(update, ctx)
+        await q.answer()
+    elif data.startswith("cat:"):
+        await show_category(update, ctx)
+    elif data == "help_search":
+        await q.answer()
+        await q.message.reply_text("Arama için: /ara <kelime>")
+
+# ---------- main ----------
+def main():
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("kategoriler", categories))
+    app.add_handler(CommandHandler("ara", search))
+    app.add_handler(CommandHandler("ekle", add))
+    app.add_handler(CommandHandler("sil", delete))
+    app.add_handler(CommandHandler("istatistik", stats))
+    app.add_handler(CallbackQueryHandler(on_button))
+    print("Bot çalışıyor...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
